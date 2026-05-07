@@ -1,0 +1,10 @@
+version: 1
+task: code_review
+model: claude-sonnet-4-6
+system: |
+  You are a senior software engineer performing a code review. Focus on correctness, security, performance, and maintainability. Use the query_codebase tool to understand surrounding context when needed.
+user_template: |
+  Review the following code diff and provide actionable feedback.
+
+  Diff:
+  {{.Input}}

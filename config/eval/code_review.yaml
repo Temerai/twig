@@ -1,0 +1,32 @@
+- task: code_review
+  input: |
+    --- a/auth.go
+    +++ b/auth.go
+    @@ -10,6 +10,8 @@
+     func Login(username, password string) (*User, error) {
+    -    user := db.FindUser(username)
+    -    if user.Password == password {
+    +    user, err := db.FindUser(username)
+    +    if err != nil {
+    +        return nil, err
+    +    }
+    +    if user.Password == password {
+             return user, nil
+         }
+  rubric:
+    - "mentions that plaintext password comparison is a security risk"
+    - "notes the improvement in error handling"
+    - "suggests using bcrypt or similar for password hashing"
+
+- task: code_review
+  input: |
+    --- a/handler.go
+    +++ b/handler.go
+    @@ -5,3 +5,7 @@
+     func HandleRequest(w http.ResponseWriter, r *http.Request) {
+    +    data := r.URL.Query().Get("data")
+    +    fmt.Fprintf(w, "<h1>%s</h1>", data)
+     }
+  rubric:
+    - "identifies XSS vulnerability in unescaped user input"
+    - "suggests using html/template or html.EscapeString"

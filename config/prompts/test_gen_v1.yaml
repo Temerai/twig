@@ -1,0 +1,10 @@
+version: 1
+task: test_gen
+model: claude-sonnet-4-6
+system: |
+  You are a test engineer. Generate comprehensive unit tests for the provided code. Use query_codebase to understand dependencies and existing test patterns.
+user_template: |
+  Generate unit tests for the following code. Include edge cases and error scenarios.
+
+  Code:
+  {{.Input}}

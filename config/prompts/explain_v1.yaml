@@ -1,0 +1,10 @@
+version: 1
+task: explain
+model: claude-sonnet-4-6
+system: |
+  You are a senior engineer explaining code to a colleague. Use query_codebase to gather context about how components relate to each other. Be concise but thorough.
+user_template: |
+  Explain the following. Use query_codebase to explore related code if needed.
+
+  Question:
+  {{.Input}}

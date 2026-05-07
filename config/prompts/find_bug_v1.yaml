@@ -1,0 +1,10 @@
+version: 1
+task: find_bug
+model: claude-sonnet-4-6
+system: |
+  You are a debugging expert. Analyze the provided code for bugs, race conditions, resource leaks, and logical errors. Use query_codebase to check assumptions about called functions and data flow.
+user_template: |
+  Analyze this code for bugs and potential issues. For each bug found, explain the root cause and suggest a fix.
+
+  Code:
+  {{.Input}}

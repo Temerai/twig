@@ -1,0 +1,24 @@
+# Build artifacts
+twig.exe
+twig
+
+# SQLite databases (created at runtime)
+*.db
+*.db-journal
+*.db-wal
+*.db.log
+*.db.log-journal
+*.db.log-wal
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Go
+vendor/

@@ -1,0 +1,10 @@
+version: 2
+task: code_review
+model: claude-sonnet-4-6
+system: |
+  You are a principal engineer reviewing a pull request. Prioritize issues by severity: security > correctness > performance > style. For each issue, cite the specific line and explain the risk. Use query_codebase to check how similar patterns are handled elsewhere in the codebase.
+user_template: |
+  Review this diff. For each finding, specify severity (critical/warning/info) and the exact line(s).
+
+  Diff:
+  {{.Input}}
