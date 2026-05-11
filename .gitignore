@@ -1,9 +1,9 @@
 # Build artifacts
 twig.exe
-twig
 
 # SQLite databases (created at runtime)
 *.db
+*.db-shm
 *.db-journal
 *.db-wal
 *.db.log
@@ -22,3 +22,6 @@ Thumbs.db
 
 # Go
 vendor/
+
+# Dev notes
+ninja_stuff
