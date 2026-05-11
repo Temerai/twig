@@ -1,4 +1,4 @@
-# Twig
+# twig
 
 Reduces LLM token usage by pre-indexing your codebase into a graph. Instead of reading entire files, the LLM queries the graph and gets only the relevant snippets. Built with Tree-sitter and SQLite, exposed via CLI and MCP. No LLM calls, no API keys.
 
@@ -35,7 +35,7 @@ twig graph callers NewStore --depth 1   # verify graph works
 ## Key Points
 
 - No API clients, no network calls. Fully offline.
-- The LLM is the editor (Claude Code, Copilot). Twig just serves graph context.
+- The LLM is the editor (Claude Code, Copilot). twig just serves graph context.
 - Seed extraction is heuristic (camelCase split, stop words, dot-join).
 - MCP server exposes 5 tools: query_codebase, analyze_impact, graph_explore, graph_stats, index_codebase.
 

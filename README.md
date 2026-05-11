@@ -1,4 +1,4 @@
-# Twig
+# twig
 
 Pre-indexes your codebase into a semantic graph using Tree-sitter. LLMs query the graph and get back only the relevant
 snippets - no more reading entire files. No API keys, no network, fully offline.
