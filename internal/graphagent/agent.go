@@ -1,6 +1,7 @@
 package graphagent
 
 import (
+	"container/list"
 	"context"
 	"fmt"
 	"os"
@@ -8,23 +9,77 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/Temerai/twig/internal/parser"
 	"github.com/Temerai/twig/internal/tokenizer"
 	"github.com/Temerai/twig/internal/types"
 )
 
+const (
+	defaultTokenEstimate = 50
+	tokensPerLine        = 7
+)
+
+const fileCacheMaxEntries = 128
+
+type fileCacheEntry struct {
+	key   string
+	lines []string
+}
+
+type fileCache struct {
+	cap   int
+	ll    *list.List
+	items map[string]*list.Element
+}
+
+func newFileCache(capacity int) *fileCache {
+	return &fileCache{
+		cap:   capacity,
+		ll:    list.New(),
+		items: make(map[string]*list.Element),
+	}
+}
+
+func (c *fileCache) get(key string) ([]string, bool) {
+	elem, ok := c.items[key]
+	if !ok {
+		return nil, false
+	}
+	c.ll.MoveToFront(elem)
+	return elem.Value.(*fileCacheEntry).lines, true
+}
+
+func (c *fileCache) put(key string, lines []string) {
+	if elem, ok := c.items[key]; ok {
+		c.ll.MoveToFront(elem)
+		elem.Value.(*fileCacheEntry).lines = lines
+		return
+	}
+	elem := c.ll.PushFront(&fileCacheEntry{key: key, lines: lines})
+	c.items[key] = elem
+	if c.ll.Len() > c.cap {
+		oldest := c.ll.Back()
+		if oldest != nil {
+			c.ll.Remove(oldest)
+			delete(c.items, oldest.Value.(*fileCacheEntry).key)
+		}
+	}
+}
+
 // GraphAgent queries a codebase graph using heuristic seed extraction and
 // configurable traversal strategies to assemble relevant code snippets.
 type GraphAgent struct {
-	store     *parser.Store
-	fileCache map[string][]string
+	store *parser.Store
+	cache *fileCache
 }
 
 // NewGraphAgent creates a GraphAgent backed by the given store.
 func NewGraphAgent(store *parser.Store) *GraphAgent {
 	return &GraphAgent{
 		store: store,
+		cache: newFileCache(fileCacheMaxEntries),
 	}
 }
 
@@ -88,6 +143,8 @@ func (ga *GraphAgent) Query(ctx context.Context, req types.QueryRequest) (*types
 		visitedIDs, err = ga.traverseScored(seedNodes, budget)
 	case types.StrategyDeep:
 		visitedIDs, err = ga.traverseDeep(seedNodes, budget)
+	case types.StrategyCallers:
+		visitedIDs, err = ga.traverseCallers(seedNodes, budget)
 	default:
 		// BFS is the default strategy.
 		visitedIDs, err = ga.traverseBFS(seedNodes, budget)
@@ -432,6 +489,63 @@ func (ga *GraphAgent) traverseDeep(seeds []types.Node, budget int) ([]string, er
 	return result, nil
 }
 
+// traverseCallers performs inbound BFS traversal, following CALLS and USES
+// edges in reverse to find all callers/users of the seed nodes.
+func (ga *GraphAgent) traverseCallers(seeds []types.Node, budget int) ([]string, error) {
+	seen := make(map[string]bool)
+	var result []string
+	queue := make([]string, 0, len(seeds))
+
+	for _, n := range seeds {
+		if !seen[n.ID] {
+			seen[n.ID] = true
+			queue = append(queue, n.ID)
+			result = append(result, n.ID)
+		}
+	}
+
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+
+		// Follow ALL incoming edges (CALLS + USES).
+		inEdges, err := ga.store.GetInEdges(current, "")
+		if err != nil {
+			return nil, fmt.Errorf("getting in-edges for %s: %w", current, err)
+		}
+
+		for _, e := range inEdges {
+			if seen[e.Src] {
+				continue
+			}
+			node, err := ga.store.GetNode(e.Src)
+			if err != nil || node == nil {
+				continue
+			}
+
+			startLine, endLine, err := parseLineRange(node.Lines)
+			if err != nil {
+				continue
+			}
+			src, ok := ga.readNodeSource(node.File, startLine, endLine)
+			if !ok {
+				continue
+			}
+			tokenCount := tokenizer.EstimateTokens(src)
+			if tokenCount > budget {
+				return result, nil
+			}
+			budget -= tokenCount
+
+			seen[e.Src] = true
+			result = append(result, node.ID)
+			queue = append(queue, node.ID)
+		}
+	}
+
+	return result, nil
+}
+
 // dfs is the recursive helper for depth-first traversal.
 func (ga *GraphAgent) dfs(nodeID string, visited map[string]bool, result *[]string, tokensUsed *int, budget int) {
 	if visited[nodeID] || *tokensUsed >= budget {
@@ -466,12 +580,12 @@ func (ga *GraphAgent) dfs(nodeID string, visited map[string]bool, result *[]stri
 func (ga *GraphAgent) estimateNodeTokens(nodeID string) int {
 	node, err := ga.store.GetNode(nodeID)
 	if err != nil || node == nil {
-		return 50
+		return defaultTokenEstimate
 	}
 
 	startLine, endLine, err := parseLineRange(node.Lines)
 	if err != nil {
-		return 50
+		return defaultTokenEstimate
 	}
 
 	src, ok := ga.readNodeSource(node.File, startLine, endLine)
@@ -484,24 +598,20 @@ func (ga *GraphAgent) estimateNodeTokens(nodeID string) int {
 	}
 
 	lineCount := endLine - startLine + 1
-	return lineCount * 7
+	return lineCount * tokensPerLine
 }
 
 // readNodeSource extracts source text for a line range from a file, using
 // the file cache to avoid redundant reads.
 func (ga *GraphAgent) readNodeSource(file string, startLine, endLine int) (string, bool) {
-	if ga.fileCache == nil {
-		ga.fileCache = make(map[string][]string)
-	}
-
-	lines, ok := ga.fileCache[file]
+	lines, ok := ga.cache.get(file)
 	if !ok {
 		data, err := os.ReadFile(file)
 		if err != nil {
 			return "", false
 		}
 		lines = strings.Split(string(data), "\n")
-		ga.fileCache[file] = lines
+		ga.cache.put(file, lines)
 	}
 
 	if startLine < 1 {
@@ -547,9 +657,13 @@ func (ga *GraphAgent) assembleSnippets(nodeIDs []string, budget int) ([]types.Co
 		if tokensUsed+tokenCount > budget {
 			remaining := budget - tokensUsed
 			if remaining > 0 {
-				maxChars := remaining * tokenizer.CharsPerToken
-				if maxChars < len(sourceText) {
-					sourceText = sourceText[:maxChars]
+				maxBytes := remaining * tokenizer.CharsPerToken
+				if maxBytes < len(sourceText) {
+					// Find the nearest valid UTF-8 boundary.
+					for maxBytes > 0 && !utf8.RuneStart(sourceText[maxBytes]) {
+						maxBytes--
+					}
+					sourceText = sourceText[:maxBytes]
 					tokenCount = remaining
 				}
 			} else {

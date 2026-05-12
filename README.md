@@ -18,26 +18,27 @@ snippets - no more reading entire files. No API keys, no network, fully offline.
 
 ## Quick Start
 
-**Building with Zig (recommended):**
+**Build script (recommended):**
 
-Set `CC` once permanently so every `go build`/`go install` picks it up:
-```powershell
-[System.Environment]::SetEnvironmentVariable("CC", "zig cc", "User")
-```
-Then reopen your terminal and build normally:
-```powershell
-go install ./cmd/twig/
+```bash
+go run build.go          # auto-detects zig, builds with FTS5
+go run build.go install  # install to $GOPATH/bin
+go run build.go smoke    # full build + verification
 ```
 
-Or set it inline per-command:
+**Manual build with Zig:**
+
 ```powershell
-$env:CC="zig cc"; go install ./cmd/twig/
+$env:CC="zig cc"; go install -tags sqlite_fts5 ./cmd/twig/
 ```
+
+> The `-tags sqlite_fts5` flag enables full-text search (`search_codebase`). Without it, all other tools work normally.
 
 **Building with GCC:**
+
 ```bash
-go build -o twig.exe ./cmd/twig/   # local binary
-go install ./cmd/twig/             # install to $GOPATH/bin
+go build -tags sqlite_fts5 -o twig.exe ./cmd/twig/   # local binary
+go install -tags sqlite_fts5 ./cmd/twig/              # install to $GOPATH/bin
 
 twig index ./path/to/codebase
 twig graph callers MyFunction --depth 3
@@ -60,15 +61,20 @@ claude mcp add --scope user twig -- twig serve --mcp
   "mcpServers": {
     "twig": {
       "command": "twig",
-      "args": ["serve", "--mcp"]
+      "args": [
+        "serve",
+        "--mcp"
+      ]
     }
   }
 }
 ```
 
-> Note: `~/.claude/mcp.json` is not read by Claude Code CLI. Use `claude mcp add` or `.mcp.json` (dot-prefixed, in project root).
+> Note: `~/.claude/mcp.json` is not read by Claude Code CLI. Use `claude mcp add` or `.mcp.json` (dot-prefixed, in
+> project root).
 
-Available tools: `query_codebase`, `analyze_impact`, `graph_explore`, `graph_stats`, `index_codebase`.
+Available tools: `query_codebase`, `analyze_impact`, `graph_explore`, `graph_stats`, `get_symbol`, `index_codebase`,
+`search_codebase`.
 
 ---
 
@@ -89,7 +95,8 @@ codebase_root: ./
 Run any command without arguments for usage. Key commands:
 
 ```bash
-twig index <path>               # parse + store the graph
+twig index <path>                              # parse + store the graph
+twig index --files file1.go,file2.go <path>   # incremental reindex for specific files
 twig graph callers <symbol>     # who calls this?
 twig graph callees <symbol>     # what does this call?
 twig graph deps <symbol>        # dependencies

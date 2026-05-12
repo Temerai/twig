@@ -3,6 +3,7 @@ package graphintel
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"unicode"
 
@@ -73,6 +74,51 @@ func (gi *GraphIntel) Callers(ctx context.Context, symbol string, depth int) ([]
 			edges, err := gi.store.GetInEdges(nodeID, "CALLS")
 			if err != nil {
 				return nil, fmt.Errorf("getting incoming CALLS edges for %s: %w", nodeID, err)
+			}
+			for _, e := range edges {
+				if seen[e.Src] {
+					continue
+				}
+				seen[e.Src] = true
+				node, err := gi.store.GetNode(e.Src)
+				if err != nil {
+					return nil, fmt.Errorf("getting node %s: %w", e.Src, err)
+				}
+				if node != nil {
+					result = append(result, *node)
+					nextFrontier = append(nextFrontier, node.ID)
+				}
+			}
+		}
+		frontier = nextFrontier
+	}
+
+	return result, nil
+}
+
+// Users finds all direct and transitive users of the given symbol via USES
+// edges (type references), up to depth levels of BFS.
+func (gi *GraphIntel) Users(ctx context.Context, symbol string, depth int) ([]types.Node, error) {
+	seeds, err := gi.resolveSymbol(symbol)
+	if err != nil {
+		return nil, err
+	}
+
+	seen := make(map[string]bool)
+	var result []types.Node
+
+	frontier := make([]string, 0, len(seeds))
+	for _, n := range seeds {
+		seen[n.ID] = true
+		frontier = append(frontier, n.ID)
+	}
+
+	for level := 0; level < depth && len(frontier) > 0; level++ {
+		var nextFrontier []string
+		for _, nodeID := range frontier {
+			edges, err := gi.store.GetInEdges(nodeID, "USES")
+			if err != nil {
+				return nil, fmt.Errorf("getting incoming USES edges for %s: %w", nodeID, err)
 			}
 			for _, e := range edges {
 				if seen[e.Src] {
@@ -202,9 +248,14 @@ func (gi *GraphIntel) Dependencies(ctx context.Context, symbol string) ([]types.
 }
 
 // ImpactOf assesses the impact of changing the given symbol. It returns an
-// ImpactReport with direct callers, transitive dependents, affected files, and
-// a risk score based on the count of direct incoming CALLS edges.
-func (gi *GraphIntel) ImpactOf(ctx context.Context, symbol string) (*types.ImpactReport, error) {
+// ImpactReport with direct callers, direct users (via USES edges), transitive
+// dependents, affected files, and a risk score based on the count of all
+// direct incoming edges.
+func (gi *GraphIntel) ImpactOf(ctx context.Context, symbol string, depth int) (*types.ImpactReport, error) {
+	if depth <= 0 {
+		depth = 5
+	}
+
 	// Resolve the symbol first to compute the risk score.
 	seeds, err := gi.resolveSymbol(symbol)
 	if err != nil {
@@ -217,10 +268,38 @@ func (gi *GraphIntel) ImpactOf(ctx context.Context, symbol string) (*types.Impac
 		return nil, fmt.Errorf("getting direct callers: %w", err)
 	}
 
-	// Transitive callers (depth=5).
-	transitiveDeps, err := gi.Callers(ctx, symbol, 5)
+	// Direct users via USES edges (depth=1).
+	directUsers, err := gi.Users(ctx, symbol, 1)
+	if err != nil {
+		return nil, fmt.Errorf("getting direct users: %w", err)
+	}
+
+	// Transitive callers.
+	transitiveCallers, err := gi.Callers(ctx, symbol, depth)
 	if err != nil {
 		return nil, fmt.Errorf("getting transitive callers: %w", err)
+	}
+
+	// Transitive users via USES edges.
+	transitiveUsers, err := gi.Users(ctx, symbol, depth)
+	if err != nil {
+		return nil, fmt.Errorf("getting transitive users: %w", err)
+	}
+
+	// Merge transitive callers and transitive users into transitiveDeps (deduplicated).
+	seen := make(map[string]bool)
+	var transitiveDeps []types.Node
+	for _, n := range transitiveCallers {
+		if !seen[n.ID] {
+			seen[n.ID] = true
+			transitiveDeps = append(transitiveDeps, n)
+		}
+	}
+	for _, n := range transitiveUsers {
+		if !seen[n.ID] {
+			seen[n.ID] = true
+			transitiveDeps = append(transitiveDeps, n)
+		}
 	}
 
 	// Collect unique affected files from all transitive nodes.
@@ -235,19 +314,20 @@ func (gi *GraphIntel) ImpactOf(ctx context.Context, symbol string) (*types.Impac
 		affectedFiles = append(affectedFiles, f)
 	}
 
-	// Compute RiskScore as the total count of direct call sites (incoming CALLS
-	// edges to any of the resolved seed nodes).
+	// Compute RiskScore as the total count of all direct incoming edges to any
+	// of the resolved seed nodes.
 	riskScore := 0
 	for _, seed := range seeds {
-		edges, err := gi.store.GetInEdges(seed.ID, "CALLS")
+		edges, err := gi.store.GetInEdges(seed.ID, "")
 		if err != nil {
-			return nil, fmt.Errorf("counting call sites for %s: %w", seed.ID, err)
+			return nil, fmt.Errorf("counting incoming edges for %s: %w", seed.ID, err)
 		}
 		riskScore += len(edges)
 	}
 
 	return &types.ImpactReport{
 		DirectCallers:  directCallers,
+		DirectUsers:    directUsers,
 		TransitiveDeps: transitiveDeps,
 		AffectedFiles:  affectedFiles,
 		RiskScore:      riskScore,
@@ -319,14 +399,9 @@ func (gi *GraphIntel) extractSymbol(question string) string {
 		candidates = append(candidates, candidate{name: tok, score: score})
 	}
 
-	// Sort by score descending so we try the most likely symbols first.
-	for i := 0; i < len(candidates); i++ {
-		for j := i + 1; j < len(candidates); j++ {
-			if candidates[j].score > candidates[i].score {
-				candidates[i], candidates[j] = candidates[j], candidates[i]
-			}
-		}
-	}
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].score > candidates[j].score
+	})
 
 	// Try each candidate against the store and return the first match.
 	for _, c := range candidates {
@@ -357,33 +432,52 @@ func (gi *GraphIntel) extractSymbol(question string) string {
 // symbol name.
 func (gi *GraphIntel) classifyQuestion(question string) (queryType string, symbol string) {
 	lower := strings.ToLower(question)
+	words := strings.Fields(lower)
 	symbol = gi.extractSymbol(question)
 
-	// Rule 1: impact/break/change/affect -> impact analysis.
-	if strings.Contains(lower, "impact") || strings.Contains(lower, "break") ||
-		strings.Contains(lower, "change") || strings.Contains(lower, "affect") {
+	hasPrefix := func(prefix string) bool {
+		for _, w := range words {
+			if strings.HasPrefix(w, prefix) {
+				return true
+			}
+		}
+		return false
+	}
+
+	hasPrefixBefore := func(prefix, before string) bool {
+		beforeIdx := -1
+		for i, w := range words {
+			if strings.HasPrefix(w, before) {
+				beforeIdx = i
+				break
+			}
+		}
+		if beforeIdx < 0 {
+			return false
+		}
+		for i := 0; i < beforeIdx; i++ {
+			if strings.HasPrefix(words[i], prefix) {
+				return true
+			}
+		}
+		return false
+	}
+
+	if hasPrefix("impact") || hasPrefix("break") || hasPrefix("change") || hasPrefix("affect") {
 		return "impact", symbol
 	}
 
-	// Rule 2: "who/what calls" -> callers.
-	if strings.Contains(lower, "call") {
-		callIdx := strings.Index(lower, "call")
-		// Check if "who" or "what" appears before "call".
-		prefix := lower[:callIdx]
-		if strings.Contains(prefix, "who") || strings.Contains(prefix, "what") {
+	if hasPrefix("call") {
+		if hasPrefixBefore("who", "call") || hasPrefixBefore("what", "call") {
 			return "callers", symbol
 		}
-		// Rule 3: "calls <symbol>" -> callees.
 		return "callees", symbol
 	}
 
-	// Rule 4: depend/import/use/need -> deps.
-	if strings.Contains(lower, "depend") || strings.Contains(lower, "import") ||
-		strings.Contains(lower, "use") || strings.Contains(lower, "need") {
+	if hasPrefix("depend") || hasPrefix("import") || hasPrefix("use") || hasPrefix("need") {
 		return "deps", symbol
 	}
 
-	// Default: callers (most common query).
 	return "callers", symbol
 }
 
@@ -426,7 +520,7 @@ func (gi *GraphIntel) NaturalQuery(ctx context.Context, question string) (*types
 		summary = formatDepsSummary(symbol, nodes)
 
 	case "impact":
-		report, err := gi.ImpactOf(ctx, symbol)
+		report, err := gi.ImpactOf(ctx, symbol, 5)
 		if err != nil {
 			return nil, err
 		}
@@ -491,9 +585,10 @@ func formatDepsSummary(symbol string, nodes []types.Node) string {
 
 func formatImpactSummary(symbol string, report *types.ImpactReport) string {
 	return fmt.Sprintf(
-		"Changing %s impacts %d direct caller(s), %d transitive dependent(s) across %d file(s). Risk score: %d.",
+		"Changing %s impacts %d direct caller(s), %d direct user(s), %d transitive dependent(s) across %d file(s). Risk score: %d.",
 		symbol,
 		len(report.DirectCallers),
+		len(report.DirectUsers),
 		len(report.TransitiveDeps),
 		len(report.AffectedFiles),
 		report.RiskScore,

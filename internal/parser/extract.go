@@ -166,6 +166,289 @@ func walkNode(node *sitter.Node, ctx *walkContext) {
 
 // --- Go ---
 
+var goBuiltinTypes = map[string]bool{
+	"bool": true, "byte": true, "complex64": true, "complex128": true,
+	"error": true, "float32": true, "float64": true,
+	"int": true, "int8": true, "int16": true, "int32": true, "int64": true,
+	"rune": true, "string": true, "uint": true, "uint8": true,
+	"uint16": true, "uint32": true, "uint64": true, "uintptr": true,
+	"any": true, "comparable": true,
+}
+
+// emitUsesEdgesFromFunc emits USES edges for type references in function parameters and return types.
+func emitUsesEdgesFromFunc(node *sitter.Node, funcID string, ctx *walkContext) {
+	// Walk all children looking for parameter lists and result types.
+	for i := 0; i < int(node.ChildCount()); i++ {
+		child := node.Child(i)
+		switch child.Type() {
+		case "parameter_list":
+			for j := 0; j < int(child.ChildCount()); j++ {
+				param := child.Child(j)
+				switch param.Type() {
+				case "parameter_declaration":
+					// type is the last child (e.g., "x Foo" → Foo is last child)
+					typeNode := param.Child(int(param.ChildCount()) - 1)
+					if typeNode != nil {
+						emitUsesForTypeNode(typeNode, funcID, ctx)
+					}
+				case "variadic_parameter_declaration":
+					// variadic: "args ...Foo" — type is last child
+					typeNode := param.Child(int(param.ChildCount()) - 1)
+					if typeNode != nil {
+						emitUsesForTypeNode(typeNode, funcID, ctx)
+					}
+				}
+			}
+		case "result":
+			// Return types: can be a single type or a parameter_list
+			if child.ChildCount() == 0 {
+				continue
+			}
+			firstChild := child.Child(0)
+			if firstChild.Type() == "parameter_list" {
+				for j := 0; j < int(firstChild.ChildCount()); j++ {
+					param := firstChild.Child(j)
+					if param.Type() == "parameter_declaration" {
+						typeNode := param.Child(int(param.ChildCount()) - 1)
+						if typeNode != nil {
+							emitUsesForTypeNode(typeNode, funcID, ctx)
+						}
+					}
+				}
+			} else {
+				emitUsesForTypeNode(firstChild, funcID, ctx)
+			}
+		}
+	}
+}
+
+// emitUsesEdgesFromStruct emits USES edges for type references in struct fields.
+func emitUsesEdgesFromStruct(structTypeNode *sitter.Node, structID string, ctx *walkContext) {
+	for i := 0; i < int(structTypeNode.ChildCount()); i++ {
+		child := structTypeNode.Child(i)
+		if child.Type() != "field_declaration_list" {
+			continue
+		}
+		for j := 0; j < int(child.ChildCount()); j++ {
+			field := child.Child(j)
+			switch field.Type() {
+			case "field_declaration":
+				// Named field: last child is the type (e.g., "Name Foo" → Foo)
+				typeNode := field.Child(int(field.ChildCount()) - 1)
+				if typeNode != nil {
+					emitUsesForTypeNode(typeNode, structID, ctx)
+				}
+			case "type_identifier":
+				// Embedded/promoted field: "type Foo struct { Bar }" — Bar is directly here
+				typeName := field.Content(ctx.source)
+				if typeName != "" && !goBuiltinTypes[typeName] {
+					ctx.edges = append(ctx.edges, types.Edge{
+						Src:  structID,
+						Dst:  typeName,
+						Kind: "USES",
+					})
+				}
+			}
+		}
+	}
+}
+
+// emitUsesForTypeNode extracts a type name from a type node and emits a USES edge.
+func emitUsesForTypeNode(typeNode *sitter.Node, srcID string, ctx *walkContext) {
+	if typeNode == nil {
+		return
+	}
+	var typeName string
+	switch typeNode.Type() {
+	case "type_identifier":
+		typeName = typeNode.Content(ctx.source)
+	case "pointer_type":
+		// *Foo — recurse into the base type
+		if typeNode.ChildCount() > 0 {
+			emitUsesForTypeNode(typeNode.Child(int(typeNode.ChildCount())-1), srcID, ctx)
+		}
+		return
+	case "slice_type", "array_type", "map_type", "channel_type":
+		// Walk all children to find type identifiers
+		for i := 0; i < int(typeNode.ChildCount()); i++ {
+			emitUsesForTypeNode(typeNode.Child(i), srcID, ctx)
+		}
+		return
+	case "qualified_type":
+		// pkg.Type — use the last child (the type name after the dot)
+		if typeNode.ChildCount() > 0 {
+			last := typeNode.Child(int(typeNode.ChildCount()) - 1)
+			typeName = last.Content(ctx.source)
+		}
+	default:
+		return
+	}
+	if typeName != "" && !goBuiltinTypes[typeName] {
+		ctx.edges = append(ctx.edges, types.Edge{
+			Src:  srcID,
+			Dst:  typeName,
+			Kind: "USES",
+		})
+	}
+}
+
+// --- Java USES helpers ---
+
+// javaTypeName returns the user-defined type name from a Java type node,
+// or "" for primitives or unrecognised nodes.
+func javaTypeName(node *sitter.Node, source []byte) string {
+	if node == nil {
+		return ""
+	}
+	switch node.Type() {
+	case "type_identifier":
+		return node.Content(source)
+	case "generic_type":
+		for i := 0; i < int(node.ChildCount()); i++ {
+			if node.Child(i).Type() == "type_identifier" {
+				return node.Child(i).Content(source)
+			}
+		}
+	case "array_type":
+		if node.ChildCount() > 0 {
+			return javaTypeName(node.Child(0), source)
+		}
+	case "scoped_type_identifier":
+		for i := int(node.ChildCount()) - 1; i >= 0; i-- {
+			c := node.Child(i)
+			if c.Type() == "type_identifier" || c.Type() == "identifier" {
+				return c.Content(source)
+			}
+		}
+	// integral_type, floating_point_type, boolean_type, void_type → skip
+	}
+	return ""
+}
+
+// emitJavaUsesFromMethod emits USES edges for a Java method's return type and parameter types.
+func emitJavaUsesFromMethod(node *sitter.Node, methodID string, ctx *walkContext) {
+	if t := findChildByFieldName(node, "type"); t != nil {
+		if name := javaTypeName(t, ctx.source); name != "" {
+			ctx.edges = append(ctx.edges, types.Edge{Src: methodID, Dst: name, Kind: "USES"})
+		}
+	}
+	params := findChildByType(node, "formal_parameters")
+	if params == nil {
+		return
+	}
+	for i := 0; i < int(params.ChildCount()); i++ {
+		p := params.Child(i)
+		if p.Type() == "formal_parameter" || p.Type() == "spread_parameter" {
+			if t := findChildByFieldName(p, "type"); t != nil {
+				if name := javaTypeName(t, ctx.source); name != "" {
+					ctx.edges = append(ctx.edges, types.Edge{Src: methodID, Dst: name, Kind: "USES"})
+				}
+			}
+		}
+	}
+}
+
+// emitJavaUsesFromClassFields emits USES edges for field types in a Java class body.
+func emitJavaUsesFromClassFields(classNode *sitter.Node, classID string, ctx *walkContext) {
+	body := findChildByType(classNode, "class_body")
+	if body == nil {
+		return
+	}
+	for i := 0; i < int(body.ChildCount()); i++ {
+		member := body.Child(i)
+		if member.Type() == "field_declaration" {
+			if t := findChildByFieldName(member, "type"); t != nil {
+				if name := javaTypeName(t, ctx.source); name != "" {
+					ctx.edges = append(ctx.edges, types.Edge{Src: classID, Dst: name, Kind: "USES"})
+				}
+			}
+		}
+	}
+}
+
+// --- C# USES helpers ---
+
+// csTypeName returns the user-defined type name from a C# type node,
+// or "" for primitives or unrecognised nodes.
+func csTypeName(node *sitter.Node, source []byte) string {
+	if node == nil {
+		return ""
+	}
+	switch node.Type() {
+	case "identifier":
+		return node.Content(source)
+	case "generic_name":
+		for i := 0; i < int(node.ChildCount()); i++ {
+			if node.Child(i).Type() == "identifier" {
+				return node.Child(i).Content(source)
+			}
+		}
+	case "nullable_type", "array_type":
+		if node.ChildCount() > 0 {
+			return csTypeName(node.Child(0), source)
+		}
+	case "qualified_name":
+		for i := int(node.ChildCount()) - 1; i >= 0; i-- {
+			if node.Child(i).Type() == "identifier" {
+				return node.Child(i).Content(source)
+			}
+		}
+	// predefined_type (void, int, string, bool...) → skip
+	}
+	return ""
+}
+
+// emitCSUsesFromMethod emits USES edges for a C# method's return type and parameter types.
+func emitCSUsesFromMethod(node *sitter.Node, methodID string, ctx *walkContext) {
+	retType := findChildByFieldName(node, "returns")
+	if retType == nil {
+		retType = findChildByFieldName(node, "type")
+	}
+	if retType != nil {
+		if name := csTypeName(retType, ctx.source); name != "" {
+			ctx.edges = append(ctx.edges, types.Edge{Src: methodID, Dst: name, Kind: "USES"})
+		}
+	}
+	params := findChildByType(node, "parameter_list")
+	if params == nil {
+		return
+	}
+	for i := 0; i < int(params.ChildCount()); i++ {
+		p := params.Child(i)
+		if p.Type() == "parameter" {
+			if t := findChildByFieldName(p, "type"); t != nil {
+				if name := csTypeName(t, ctx.source); name != "" {
+					ctx.edges = append(ctx.edges, types.Edge{Src: methodID, Dst: name, Kind: "USES"})
+				}
+			}
+		}
+	}
+}
+
+// emitCSUsesFromTypeFields emits USES edges for field types in a C# class/struct/interface body.
+func emitCSUsesFromTypeFields(typeNode *sitter.Node, typeID string, ctx *walkContext) {
+	declList := findChildByType(typeNode, "declaration_list")
+	if declList == nil {
+		return
+	}
+	for i := 0; i < int(declList.ChildCount()); i++ {
+		member := declList.Child(i)
+		if member.Type() == "field_declaration" {
+			t := findChildByFieldName(member, "type")
+			if t == nil {
+				if varDecl := findChildByType(member, "variable_declaration"); varDecl != nil {
+					t = findChildByFieldName(varDecl, "type")
+				}
+			}
+			if t != nil {
+				if name := csTypeName(t, ctx.source); name != "" {
+					ctx.edges = append(ctx.edges, types.Edge{Src: typeID, Dst: name, Kind: "USES"})
+				}
+			}
+		}
+	}
+}
+
 func walkGo(node *sitter.Node, nodeType string, ctx *walkContext) {
 	switch nodeType {
 	case "function_declaration":
@@ -183,6 +466,7 @@ func walkGo(node *sitter.Node, nodeType string, ctx *walkContext) {
 			Signature: firstLine(ctx.source, node),
 			Lines:     lineRange(node),
 		})
+		emitUsesEdgesFromFunc(node, id, ctx)
 		ctx.functionStack = append(ctx.functionStack, id)
 		walkChildren(node, ctx)
 		ctx.functionStack = ctx.functionStack[:len(ctx.functionStack)-1]
@@ -213,6 +497,7 @@ func walkGo(node *sitter.Node, nodeType string, ctx *walkContext) {
 			Signature: firstLine(ctx.source, node),
 			Lines:     lineRange(node),
 		})
+		emitUsesEdgesFromFunc(node, id, ctx)
 		ctx.functionStack = append(ctx.functionStack, id)
 		walkChildren(node, ctx)
 		ctx.functionStack = ctx.functionStack[:len(ctx.functionStack)-1]
@@ -249,6 +534,9 @@ func walkGo(node *sitter.Node, nodeType string, ctx *walkContext) {
 					Signature: firstLine(ctx.source, child),
 					Lines:     lineRange(child),
 				})
+				if body := findChildByFieldName(child, "type"); body != nil && body.Type() == "struct_type" {
+					emitUsesEdgesFromStruct(body, id, ctx)
+				}
 				ctx.classStack = append(ctx.classStack, typeName)
 				walkChildren(child, ctx)
 				ctx.classStack = ctx.classStack[:len(ctx.classStack)-1]
@@ -269,6 +557,40 @@ func walkGo(node *sitter.Node, nodeType string, ctx *walkContext) {
 				Dst:  calledName,
 				Kind: "CALLS",
 			})
+		}
+		walkChildren(node, ctx)
+		return
+
+	case "composite_literal":
+		if ctx.currentFunction() != "" && node.ChildCount() > 0 {
+			first := node.Child(0)
+			if first.Type() == "type_identifier" || first.Type() == "qualified_type" {
+				emitUsesForTypeNode(first, ctx.currentFunction(), ctx)
+			}
+		}
+		walkChildren(node, ctx)
+		return
+
+	case "type_assertion_expression":
+		if ctx.currentFunction() != "" {
+			for i := 0; i < int(node.ChildCount()); i++ {
+				child := node.Child(i)
+				if child.Type() == "type_identifier" {
+					emitUsesForTypeNode(child, ctx.currentFunction(), ctx)
+				}
+			}
+		}
+		walkChildren(node, ctx)
+		return
+
+	case "type_case":
+		if ctx.currentFunction() != "" {
+			for i := 0; i < int(node.ChildCount()); i++ {
+				child := node.Child(i)
+				if child.Type() == "type_identifier" {
+					emitUsesForTypeNode(child, ctx.currentFunction(), ctx)
+				}
+			}
 		}
 		walkChildren(node, ctx)
 		return
@@ -559,6 +881,7 @@ func walkJava(node *sitter.Node, nodeType string, ctx *walkContext) {
 			Signature: firstLine(ctx.source, node),
 			Lines:     lineRange(node),
 		})
+		emitJavaUsesFromMethod(node, id, ctx)
 		ctx.functionStack = append(ctx.functionStack, id)
 		walkChildren(node, ctx)
 		ctx.functionStack = ctx.functionStack[:len(ctx.functionStack)-1]
@@ -579,6 +902,7 @@ func walkJava(node *sitter.Node, nodeType string, ctx *walkContext) {
 			Signature: firstLine(ctx.source, node),
 			Lines:     lineRange(node),
 		})
+		emitJavaUsesFromClassFields(node, id, ctx)
 		ctx.classStack = append(ctx.classStack, name)
 		walkChildren(node, ctx)
 		ctx.classStack = ctx.classStack[:len(ctx.classStack)-1]
@@ -659,6 +983,7 @@ func walkCSharp(node *sitter.Node, nodeType string, ctx *walkContext) {
 			Signature: firstLine(ctx.source, node),
 			Lines:     lineRange(node),
 		})
+		emitCSUsesFromMethod(node, id, ctx)
 		ctx.functionStack = append(ctx.functionStack, id)
 		walkChildren(node, ctx)
 		ctx.functionStack = ctx.functionStack[:len(ctx.functionStack)-1]
@@ -679,6 +1004,7 @@ func walkCSharp(node *sitter.Node, nodeType string, ctx *walkContext) {
 			Signature: firstLine(ctx.source, node),
 			Lines:     lineRange(node),
 		})
+		emitCSUsesFromTypeFields(node, id, ctx)
 		ctx.classStack = append(ctx.classStack, name)
 		walkChildren(node, ctx)
 		ctx.classStack = ctx.classStack[:len(ctx.classStack)-1]
@@ -699,6 +1025,7 @@ func walkCSharp(node *sitter.Node, nodeType string, ctx *walkContext) {
 			Signature: firstLine(ctx.source, node),
 			Lines:     lineRange(node),
 		})
+		emitCSUsesFromTypeFields(node, id, ctx)
 		ctx.classStack = append(ctx.classStack, name)
 		walkChildren(node, ctx)
 		ctx.classStack = ctx.classStack[:len(ctx.classStack)-1]
@@ -719,6 +1046,7 @@ func walkCSharp(node *sitter.Node, nodeType string, ctx *walkContext) {
 			Signature: firstLine(ctx.source, node),
 			Lines:     lineRange(node),
 		})
+		emitCSUsesFromTypeFields(node, id, ctx)
 		ctx.classStack = append(ctx.classStack, name)
 		walkChildren(node, ctx)
 		ctx.classStack = ctx.classStack[:len(ctx.classStack)-1]
@@ -763,6 +1091,7 @@ func walkChildren(node *sitter.Node, ctx *walkContext) {
 // handleArrowFunctionDecl checks for arrow function assignments:
 // const foo = (...) => { ... }
 func handleArrowFunctionDecl(node *sitter.Node, ctx *walkContext) {
+	found := false
 	for i := 0; i < int(node.ChildCount()); i++ {
 		child := node.Child(i)
 		if child.Type() == "variable_declarator" {
@@ -773,6 +1102,7 @@ func handleArrowFunctionDecl(node *sitter.Node, ctx *walkContext) {
 				if name == "" {
 					continue
 				}
+				found = true
 				id := nodeID(ctx.filePath, name)
 				ctx.nodes = append(ctx.nodes, types.Node{
 					ID:        id,
@@ -780,18 +1110,18 @@ func handleArrowFunctionDecl(node *sitter.Node, ctx *walkContext) {
 					Language:  ctx.langName,
 					Kind:      "function",
 					Name:      name,
-					Signature: firstLine(ctx.source, node),
-					Lines:     lineRange(node),
+					Signature: firstLine(ctx.source, child),
+					Lines:     lineRange(child),
 				})
 				ctx.functionStack = append(ctx.functionStack, id)
 				walkChildren(valueNode, ctx)
 				ctx.functionStack = ctx.functionStack[:len(ctx.functionStack)-1]
-				return
 			}
 		}
 	}
-	// If no arrow function found, walk children normally.
-	walkChildren(node, ctx)
+	if !found {
+		walkChildren(node, ctx)
+	}
 }
 
 // extractCallName extracts the called function/method name from a call expression.

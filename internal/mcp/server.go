@@ -94,10 +94,11 @@ type toolSchema struct {
 }
 
 type schemaProperty struct {
-	Type        string   `json:"type"`
-	Description string   `json:"description"`
-	Default     any      `json:"default,omitempty"`
-	Enum        []string `json:"enum,omitempty"`
+	Type        string          `json:"type"`
+	Description string          `json:"description"`
+	Default     any             `json:"default,omitempty"`
+	Enum        []string        `json:"enum,omitempty"`
+	Items       *schemaProperty `json:"items,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -270,43 +271,57 @@ func (s *Server) handlePing(req *JSONRPCRequest) JSONRPCResponse {
 func (s *Server) handleToolsList(req *JSONRPCRequest) JSONRPCResponse {
 	tools := []toolInfo{
 		{
-			Name:        "query_codebase",
-			Description: "Query the codebase graph using natural language. Returns relevant code snippets assembled via graph traversal.",
+			Name: "query_codebase",
+			Description: `Explore the codebase by question when you don't know the exact symbol name. Extracts seeds from the question, traverses the graph, and returns ranked code snippets within the token budget.
+
+USE THIS when: understanding how a feature works, tracing data flow, answering "how does X happen", exploring unfamiliar areas, or when get_symbol/search_codebase return nothing useful.
+
+Strategy guide (default "scored" is right most of the time):
+- "scored"  — best general-purpose; ranks nodes by relevance score (default)
+- "bfs"     — breadth-first; good for shallow exploration of nearby symbols
+- "deep"    — depth-first; best for tracing an end-to-end call chain
+- "callers" — seeds on callers first; use when you want to understand how something is used
+
+Prefer get_symbol if you already know the exact name. Prefer search_codebase for keyword/string literal matches.`,
 			InputSchema: toolSchema{
 				Type: "object",
 				Properties: map[string]schemaProperty{
 					"question": {
 						Type:        "string",
-						Description: "Natural language question about the codebase",
+						Description: "Natural language question about the codebase, e.g. 'how does authentication work' or 'where is the cache evicted'",
 					},
 					"token_budget": {
 						Type:        "integer",
-						Description: "Maximum tokens of code context to return",
+						Description: "Maximum tokens of code context to return (default 4000; increase to 8000+ for complex flows)",
 						Default:     4000,
 					},
 					"strategy": {
 						Type:        "string",
-						Description: "Graph traversal strategy",
+						Description: "Graph traversal strategy: scored (default), bfs, deep, or callers",
 						Default:     "scored",
-						Enum:        []string{"bfs", "scored", "deep"},
+						Enum:        []string{"bfs", "scored", "deep", "callers"},
 					},
 				},
 				Required: []string{"question"},
 			},
 		},
 		{
-			Name:        "analyze_impact",
-			Description: "Analyze the blast radius of changing a symbol. Returns direct callers, transitive dependents, affected files, and a risk score.",
+			Name: "analyze_impact",
+			Description: `Measure the blast radius of modifying or deleting a symbol. Returns direct callers, direct users (non-call references), transitive dependents, all affected files, and a risk score.
+
+USE THIS before: renaming, refactoring, changing a signature, or deleting any function, method, or type. The risk score and affected-file list tell you how safe the change is and what tests to run.
+
+Prefer graph_explore when you only want a lightweight list of callers or callees without the full impact report.`,
 			InputSchema: toolSchema{
 				Type: "object",
 				Properties: map[string]schemaProperty{
 					"symbol": {
 						Type:        "string",
-						Description: "Name of the function, method, or type to analyze",
+						Description: "Exact name of the function, method, or type to analyze",
 					},
 					"depth": {
 						Type:        "integer",
-						Description: "Maximum depth for transitive dependency analysis",
+						Description: "Maximum depth for transitive dependent traversal (default 3; increase for deep dependency chains)",
 						Default:     3,
 					},
 				},
@@ -314,23 +329,30 @@ func (s *Server) handleToolsList(req *JSONRPCRequest) JSONRPCResponse {
 			},
 		},
 		{
-			Name:        "graph_explore",
-			Description: "Explore the codebase graph by listing callers, callees, or dependencies of a symbol.",
+			Name: "graph_explore",
+			Description: `List callers, callees, or type dependencies of a symbol up to a given depth. Returns names, kinds, file paths, and line ranges — no risk scoring.
+
+USE THIS when: browsing who calls a function (callers), what a function calls (callees), or what types a symbol depends on (deps). Lighter than analyze_impact when you just need the graph neighbourhood without a full blast-radius report.
+
+Modes:
+- "callers" — symbols that call this symbol
+- "callees" — symbols this symbol calls
+- "deps"    — types/interfaces this symbol depends on (USES edges)`,
 			InputSchema: toolSchema{
 				Type: "object",
 				Properties: map[string]schemaProperty{
 					"mode": {
 						Type:        "string",
-						Description: "Exploration mode",
+						Description: "callers: who calls this symbol | callees: what this symbol calls | deps: type dependencies (USES edges)",
 						Enum:        []string{"callers", "callees", "deps"},
 					},
 					"symbol": {
 						Type:        "string",
-						Description: "Name of the function, method, or type to explore",
+						Description: "Exact name of the function, method, or type to explore",
 					},
 					"depth": {
 						Type:        "integer",
-						Description: "Maximum traversal depth",
+						Description: "Maximum traversal depth (default 3)",
 						Default:     3,
 					},
 				},
@@ -338,22 +360,67 @@ func (s *Server) handleToolsList(req *JSONRPCRequest) JSONRPCResponse {
 			},
 		},
 		{
-			Name:        "graph_stats",
-			Description: "Return the number of nodes and edges currently in the codebase graph.",
+			Name: "graph_stats",
+			Description: `Return a full breakdown of the indexed codebase graph: total node count, edge count, file count, nodes grouped by kind (function/method/struct/…), edges grouped by kind (CALLS/USES/…), and node counts per language.
+
+USE THIS to: verify the index is populated before querying, check which languages were indexed, or diagnose an unexpectedly sparse graph. Run index_codebase first if counts are zero.`,
 			InputSchema: toolSchema{
 				Type:       "object",
 				Properties: map[string]schemaProperty{},
 			},
 		},
 		{
-			Name:        "index_codebase",
-			Description: "Index (or re-index) the codebase at the given path. Returns node and edge counts after indexing.",
+			Name: "get_symbol",
+			Description: `Fetch source code and metadata for a symbol by exact name. Returns file path, line range, signature, and full source for every match.
+
+USE THIS first whenever you already know the symbol name — it is the fastest and most precise lookup. Falls back to kind filter if multiple symbols share the same name.
+
+If the name is uncertain or partially known, use search_codebase instead. If you need semantic context around the symbol, follow up with query_codebase.`,
+			InputSchema: toolSchema{
+				Type: "object",
+				Properties: map[string]schemaProperty{
+					"name": {Type: "string", Description: "Exact symbol name (function, method, struct, class, interface, or type)"},
+					"kind": {Type: "string", Description: "Optional: narrow results to one kind when multiple symbols share the same name", Enum: []string{"function", "method", "struct", "interface", "class", "type"}},
+				},
+				Required: []string{"name"},
+			},
+		},
+		{
+			Name: "search_codebase",
+			Description: `Full-text search (FTS5) over indexed symbol names and source code. Returns matching symbols with source snippets.
+
+USE THIS when: you know a keyword, error string, constant, partial name, or code pattern but not the exact symbol name. Faster than query_codebase for keyword lookups.
+
+FTS5 syntax tips: use OR for alternatives (e.g. "parse OR lex"), wrap phrases in quotes (e.g. '"token budget"'), prefix-match with * (e.g. "extract*").
+
+If exact name is known, prefer get_symbol. If you need semantic/conceptual results, use query_codebase.`,
+			InputSchema: toolSchema{
+				Type: "object",
+				Properties: map[string]schemaProperty{
+					"query": {Type: "string", Description: "FTS5 search query: keywords, OR alternatives, \"quoted phrases\", or prefix* matches"},
+					"limit": {Type: "integer", Description: "Maximum results to return (default 20)", Default: 20},
+				},
+				Required: []string{"query"},
+			},
+		},
+		{
+			Name: "index_codebase",
+			Description: `Build or refresh the codebase graph index. Returns total node and edge counts when done.
+
+USE THIS: at the start of a session if graph_stats shows zero nodes, or after editing source files to keep the graph current.
+
+For full reindex omit changed_files (or provide a path). For incremental updates after editing a few files, pass changed_files — this is much faster than a full reindex and avoids stale graph data.`,
 			InputSchema: toolSchema{
 				Type: "object",
 				Properties: map[string]schemaProperty{
 					"path": {
 						Type:        "string",
-						Description: "Root directory to index (defaults to the configured codebase root)",
+						Description: "Root directory to index (defaults to the configured codebase root); ignored when changed_files is provided",
+					},
+					"changed_files": {
+						Type:        "array",
+						Description: "Incremental mode: list of edited file paths to reindex. Much faster than a full reindex — use after saving edits.",
+						Items:       &schemaProperty{Type: "string"},
 					},
 				},
 			},
@@ -396,6 +463,10 @@ func (s *Server) handleToolsCall(ctx context.Context, req *JSONRPCRequest) JSONR
 		result = s.callGraphExplore(ctx, params.Arguments)
 	case "graph_stats":
 		result = s.callGraphStats()
+	case "get_symbol":
+		result = s.callGetSymbol(ctx, params.Arguments)
+	case "search_codebase":
+		result = s.callSearchCodebase(ctx, params.Arguments)
 	case "index_codebase":
 		result = s.callIndexCodebase(params.Arguments)
 	default:
@@ -439,10 +510,12 @@ func (s *Server) callQueryCodebase(ctx context.Context, raw json.RawMessage) too
 		strategy = types.StrategyBFS
 	case "deep":
 		strategy = types.StrategyDeep
+	case "callers":
+		strategy = types.StrategyCallers
 	case "scored", "":
 		strategy = types.StrategyScored
 	default:
-		return makeErrorResult(fmt.Sprintf("unknown strategy %q; use bfs, scored, or deep", args.Strategy))
+		return makeErrorResult(fmt.Sprintf("unknown strategy %q; use bfs, scored, deep, or callers", args.Strategy))
 	}
 
 	qr, err := s.agent.Query(ctx, types.QueryRequest{
@@ -494,7 +567,7 @@ func (s *Server) callAnalyzeImpact(ctx context.Context, raw json.RawMessage) too
 		args.Depth = 3
 	}
 
-	report, err := s.intel.ImpactOf(ctx, args.Symbol)
+	report, err := s.intel.ImpactOf(ctx, args.Symbol, args.Depth)
 	if err != nil {
 		return makeErrorResult("impact analysis failed: " + err.Error())
 	}
@@ -505,16 +578,20 @@ func (s *Server) callAnalyzeImpact(ctx context.Context, raw json.RawMessage) too
 func formatImpactReport(symbol string, r *types.ImpactReport) string {
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("Impact analysis for %q:\n", symbol))
-	sb.WriteString(fmt.Sprintf("  Risk score: %d\n", r.RiskScore))
-	sb.WriteString(fmt.Sprintf("  Direct callers: %d\n", len(r.DirectCallers)))
+	sb.WriteString(fmt.Sprintf("  Risk score:       %d\n", r.RiskScore))
+	sb.WriteString(fmt.Sprintf("  Direct callers:   %d\n", len(r.DirectCallers)))
 	for _, n := range r.DirectCallers {
+		sb.WriteString(fmt.Sprintf("    - %s (%s, %s)\n", n.Name, n.Kind, n.File))
+	}
+	sb.WriteString(fmt.Sprintf("  Direct users:     %d\n", len(r.DirectUsers)))
+	for _, n := range r.DirectUsers {
 		sb.WriteString(fmt.Sprintf("    - %s (%s, %s)\n", n.Name, n.Kind, n.File))
 	}
 	sb.WriteString(fmt.Sprintf("  Transitive dependents: %d\n", len(r.TransitiveDeps)))
 	for _, n := range r.TransitiveDeps {
 		sb.WriteString(fmt.Sprintf("    - %s (%s, %s)\n", n.Name, n.Kind, n.File))
 	}
-	sb.WriteString(fmt.Sprintf("  Affected files: %d\n", len(r.AffectedFiles)))
+	sb.WriteString(fmt.Sprintf("  Affected files:   %d\n", len(r.AffectedFiles)))
 	for _, f := range r.AffectedFiles {
 		sb.WriteString(fmt.Sprintf("    - %s\n", f))
 	}
@@ -585,34 +662,122 @@ func formatNodeList(label, symbol string, nodes []types.Node) string {
 // --- graph_stats ---
 
 func (s *Server) callGraphStats() toolResult {
-	nodeCount, edgeCount, err := s.store.Stats()
+	stats, err := s.store.DetailedStats()
 	if err != nil {
-		return makeErrorResult("stats failed: " + err.Error())
+		return makeErrorResult(fmt.Sprintf("stats failed: %v", err))
 	}
-	return makeTextResult(fmt.Sprintf("Graph contains %d nodes and %d edges.", nodeCount, edgeCount))
+	data, err := json.Marshal(stats)
+	if err != nil {
+		return makeErrorResult(fmt.Sprintf("marshal stats: %v", err))
+	}
+	return makeTextResult(string(data))
+}
+
+// --- get_symbol ---
+
+func (s *Server) callGetSymbol(ctx context.Context, raw json.RawMessage) toolResult {
+	var args struct {
+		Name string `json:"name"`
+		Kind string `json:"kind"`
+	}
+	if err := json.Unmarshal(raw, &args); err != nil {
+		return makeErrorResult(fmt.Sprintf("invalid args: %v", err))
+	}
+	if args.Name == "" {
+		return makeErrorResult("name is required")
+	}
+
+	nodes, err := s.store.GetNodeByName(args.Name)
+	if err != nil {
+		return makeErrorResult(fmt.Sprintf("lookup failed: %v", err))
+	}
+
+	if args.Kind != "" {
+		var filtered []types.Node
+		for _, n := range nodes {
+			if n.Kind == args.Kind {
+				filtered = append(filtered, n)
+			}
+		}
+		nodes = filtered
+	}
+
+	if len(nodes) == 0 {
+		return makeTextResult(fmt.Sprintf("symbol %q not found", args.Name))
+	}
+
+	var sb strings.Builder
+	for i, n := range nodes {
+		sb.WriteString(fmt.Sprintf("--- %d. %s [%s] %s lines %s ---\n", i+1, n.Name, n.Kind, n.File, n.Lines))
+		sb.WriteString(fmt.Sprintf("Signature: %s\n", n.Signature))
+		if n.Source != "" {
+			sb.WriteString(n.Source)
+			sb.WriteString("\n")
+		}
+		sb.WriteString("\n")
+	}
+	return makeTextResult(sb.String())
+}
+
+// --- search_codebase ---
+
+func (s *Server) callSearchCodebase(ctx context.Context, raw json.RawMessage) toolResult {
+	var args struct {
+		Query string `json:"query"`
+		Limit int    `json:"limit"`
+	}
+	if err := json.Unmarshal(raw, &args); err != nil {
+		return makeErrorResult(fmt.Sprintf("invalid args: %v", err))
+	}
+	if args.Query == "" {
+		return makeErrorResult("query is required")
+	}
+
+	results, err := s.store.SearchFTS(args.Query, args.Limit)
+	if err != nil {
+		return makeErrorResult(fmt.Sprintf("search failed: %v", err))
+	}
+	if len(results) == 0 {
+		return makeTextResult("No matches found.")
+	}
+
+	var sb strings.Builder
+	for i, n := range results {
+		sb.WriteString(fmt.Sprintf("--- %d. %s [%s] %s lines %s ---\n", i+1, n.Name, n.Kind, n.File, n.Lines))
+		if n.Source != "" {
+			sb.WriteString(n.Source)
+			sb.WriteString("\n")
+		}
+		sb.WriteString("\n")
+	}
+	return makeTextResult(sb.String())
 }
 
 // --- index_codebase ---
 
-type indexCodebaseArgs struct {
-	Path string `json:"path"`
-}
-
 func (s *Server) callIndexCodebase(raw json.RawMessage) toolResult {
-	var args indexCodebaseArgs
+	var args struct {
+		Path         string   `json:"path"`
+		ChangedFiles []string `json:"changed_files"`
+	}
 	if raw != nil && len(raw) > 0 {
 		if err := json.Unmarshal(raw, &args); err != nil {
 			return makeErrorResult("invalid arguments: " + err.Error())
 		}
 	}
 
-	rootPath := args.Path
-	if rootPath == "" {
-		rootPath = s.indexer.RootPath()
-	}
-
-	if err := s.indexer.Index(rootPath); err != nil {
-		return makeErrorResult("indexing failed: " + err.Error())
+	if len(args.ChangedFiles) > 0 {
+		if err := s.indexer.Reindex(args.ChangedFiles); err != nil {
+			return makeErrorResult(fmt.Sprintf("reindex failed: %v", err))
+		}
+	} else {
+		root := args.Path
+		if root == "" {
+			root = s.indexer.RootPath()
+		}
+		if err := s.indexer.Index(root); err != nil {
+			return makeErrorResult(fmt.Sprintf("index failed: %v", err))
+		}
 	}
 
 	nodeCount, edgeCount, err := s.store.Stats()

@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -9,7 +10,9 @@ import (
 )
 
 func newIndexCmd() *cobra.Command {
-	return &cobra.Command{
+	var files string
+
+	cmd := &cobra.Command{
 		Use:   "index <path>",
 		Short: "Build or update the codebase graph index",
 		Args:  cobra.ExactArgs(1),
@@ -24,9 +27,27 @@ func newIndexCmd() *cobra.Command {
 
 			indexer := parser.NewIndexer(store, rootPath)
 
-			fmt.Printf("Indexing %s...\n", rootPath)
-			if err := indexer.Index(rootPath); err != nil {
-				return fmt.Errorf("indexing: %w", err)
+			if files != "" {
+				parts := strings.Split(files, ",")
+				var changedFiles []string
+				for _, f := range parts {
+					f = strings.TrimSpace(f)
+					if f != "" {
+						changedFiles = append(changedFiles, f)
+					}
+				}
+				if len(changedFiles) == 0 {
+					return fmt.Errorf("--files specified but no valid file paths provided")
+				}
+				fmt.Printf("Reindexing %d file(s)...\n", len(changedFiles))
+				if err := indexer.Reindex(changedFiles); err != nil {
+					return fmt.Errorf("reindexing: %w", err)
+				}
+			} else {
+				fmt.Printf("Indexing %s...\n", rootPath)
+				if err := indexer.Index(rootPath); err != nil {
+					return fmt.Errorf("indexing: %w", err)
+				}
 			}
 
 			nodeCount, edgeCount, err := store.Stats()
@@ -37,4 +58,7 @@ func newIndexCmd() *cobra.Command {
 			return nil
 		},
 	}
+
+	cmd.Flags().StringVar(&files, "files", "", "comma-separated list of files to reindex incrementally")
+	return cmd
 }

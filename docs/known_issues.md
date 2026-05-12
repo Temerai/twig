@@ -1,4 +1,4 @@
-# Cortex - Known Issues
+# twig — Known Issues
 
 ## Parser / Indexer
 
@@ -28,3 +28,32 @@
 - **NL classification misroutes direction queries.** `"what does X call"` is classified as `callers` instead of
   `callees` because the keyword rules treat `"call"` as a callers signal regardless of grammatical direction. The query
   still returns related nodes but from the wrong direction.
+
+## USES edges (v0.2.0)
+
+- **USES edges only implemented for Go, Java, and C#.** Python and JS/TS walkers still only emit CALLS/IMPORTS edges.
+
+- **Java/C# USES edges cover method params, return types, and field types.** Generic type arguments (e.g., `List<Foo>`) emit a USES edge for the outer container type only; the type argument `Foo` itself is not captured.
+
+- **Cross-file inheritance is not tracked.** No walker produces INHERITS edges, so `extends`/`:` relationships
+  across files are invisible to `analyze_impact`.
+
+## Dev Notes
+
+- **`stopWords` map duplicated** between `graphagent/agent.go` and `graphintel/intel.go`. Extract to shared package
+  when either map changes.
+
+- **`Callers`/`Users`/`Callees` in `graphintel/intel.go` are near-identical.** Refactor to a single parameterised
+  BFS helper (`bfsTraverse(ctx, symbol, depth, direction, edgeKind)`) to reduce ~80 lines of duplication.
+
+- **`ImpactOf` resolves the symbol redundantly.** Each sub-call (`Callers`, `Users`) re-resolves the same symbol
+  against the database. Pass resolved seeds directly to avoid 5x DB lookups.
+
+- **`fileCache` in `graphagent` is not goroutine-safe.** Currently safe because the MCP server is single-threaded.
+  Add a `sync.Mutex` before adding concurrent request handling.
+
+- **`SearchNodesFuzzy` runs up to 8 unindexed full-table scans.** Consider a trigram index or cached prefix table
+  for large codebases.
+
+- **`readNodeSourceText` in `indexer.go` is unused in production.** Kept for tests but could be removed if
+  `extractLinesFromSlice` covers all needs.

@@ -1,7 +1,18 @@
 {
   "permissions": {
     "allow": [
-      "mcp__twig__index_codebase"
+      "mcp__twig__index_codebase",
+      "mcp__twig__query_codebase",
+      "mcp__twig__get_symbol",
+      "Bash(./twig.exe graph *)",
+      "Bash(./twig.exe index *)",
+      "mcp__twig__analyze_impact",
+      "mcp__twig__search_codebase",
+      "Bash(go vet *)",
+      "Bash(go test *)",
+      "Bash(echo \"exit: $?\")",
+      "Bash(go build *)",
+      "Bash(go run *)"
     ]
   }
 }

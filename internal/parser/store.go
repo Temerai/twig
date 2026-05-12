@@ -12,7 +12,8 @@ import (
 
 // Store provides a SQLite-backed graph store for codebase nodes and edges.
 type Store struct {
-	db *sql.DB
+	db           *sql.DB
+	ftsAvailable bool
 }
 
 // NewStore opens (or creates) a SQLite database at dbPath and initialises
@@ -45,7 +46,8 @@ CREATE TABLE IF NOT EXISTS nodes(
     kind TEXT,
     name TEXT,
     signature TEXT,
-    lines TEXT
+    lines TEXT,
+    source TEXT
 );
 CREATE TABLE IF NOT EXISTS edges(
     src TEXT,
@@ -62,6 +64,27 @@ CREATE INDEX IF NOT EXISTS idx_nodes_file ON nodes(file);
 	if err != nil {
 		return fmt.Errorf("creating tables: %w", err)
 	}
+
+	// Migrate: add source column if it doesn't exist (for pre-existing databases).
+	s.db.Exec(`ALTER TABLE nodes ADD COLUMN source TEXT DEFAULT ''`)
+
+	// Migrate: drop stale FTS5 table if schema changed (content= removed, id column added).
+	var ftsSQL string
+	s.db.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='nodes_fts'`).Scan(&ftsSQL)
+	if ftsSQL != "" && !strings.Contains(strings.ToUpper(ftsSQL), "UNINDEXED") {
+		s.db.Exec(`DROP TABLE IF EXISTS nodes_fts`)
+	}
+
+	// Create FTS5 virtual table. Non-fatal if FTS5 module is unavailable.
+	// Plain (non-content) table avoids rowid corruption on INSERT OR REPLACE upserts.
+	// id is stored UNINDEXED for precise JOIN back to the nodes table.
+	_, ftsErr := s.db.Exec(`CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(id UNINDEXED, name, signature, source)`)
+	if ftsErr != nil {
+		s.ftsAvailable = false
+	} else {
+		s.ftsAvailable = true
+	}
+
 	return nil
 }
 
@@ -77,14 +100,14 @@ func (s *Store) UpsertNodes(nodes []types.Node) error {
 	}
 	defer tx.Rollback()
 
-	stmt, err := tx.Prepare(`INSERT OR REPLACE INTO nodes(id, file, language, kind, name, signature, lines) VALUES(?,?,?,?,?,?,?)`)
+	stmt, err := tx.Prepare(`INSERT OR REPLACE INTO nodes(id, file, language, kind, name, signature, lines, source) VALUES(?,?,?,?,?,?,?,?)`)
 	if err != nil {
 		return fmt.Errorf("prepare upsert nodes: %w", err)
 	}
 	defer stmt.Close()
 
 	for _, n := range nodes {
-		if _, err := stmt.Exec(n.ID, n.File, n.Language, n.Kind, n.Name, n.Signature, n.Lines); err != nil {
+		if _, err := stmt.Exec(n.ID, n.File, n.Language, n.Kind, n.Name, n.Signature, n.Lines, n.Source); err != nil {
 			return fmt.Errorf("upsert node %s: %w", n.ID, err)
 		}
 	}
@@ -151,9 +174,9 @@ func (s *Store) DeleteByFile(file string) error {
 
 // GetNode retrieves a single node by its ID.
 func (s *Store) GetNode(id string) (*types.Node, error) {
-	row := s.db.QueryRow(`SELECT id, file, language, kind, name, signature, lines FROM nodes WHERE id = ?`, id)
+	row := s.db.QueryRow(`SELECT id, file, language, kind, name, signature, lines, source FROM nodes WHERE id = ?`, id)
 	n := &types.Node{}
-	err := row.Scan(&n.ID, &n.File, &n.Language, &n.Kind, &n.Name, &n.Signature, &n.Lines)
+	err := row.Scan(&n.ID, &n.File, &n.Language, &n.Kind, &n.Name, &n.Signature, &n.Lines, &n.Source)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -165,7 +188,7 @@ func (s *Store) GetNode(id string) (*types.Node, error) {
 
 // GetNodeByName returns all nodes whose name matches exactly.
 func (s *Store) GetNodeByName(name string) ([]types.Node, error) {
-	rows, err := s.db.Query(`SELECT id, file, language, kind, name, signature, lines FROM nodes WHERE name = ?`, name)
+	rows, err := s.db.Query(`SELECT id, file, language, kind, name, signature, lines, source FROM nodes WHERE name = ?`, name)
 	if err != nil {
 		return nil, fmt.Errorf("get nodes by name %s: %w", name, err)
 	}
@@ -174,7 +197,7 @@ func (s *Store) GetNodeByName(name string) ([]types.Node, error) {
 	var nodes []types.Node
 	for rows.Next() {
 		var n types.Node
-		if err := rows.Scan(&n.ID, &n.File, &n.Language, &n.Kind, &n.Name, &n.Signature, &n.Lines); err != nil {
+		if err := rows.Scan(&n.ID, &n.File, &n.Language, &n.Kind, &n.Name, &n.Signature, &n.Lines, &n.Source); err != nil {
 			return nil, fmt.Errorf("scanning node: %w", err)
 		}
 		nodes = append(nodes, n)
@@ -236,7 +259,7 @@ func (s *Store) GetInEdges(nodeID string, kind string) ([]types.Edge, error) {
 
 // AllNodes returns every node in the store.
 func (s *Store) AllNodes() ([]types.Node, error) {
-	rows, err := s.db.Query(`SELECT id, file, language, kind, name, signature, lines FROM nodes`)
+	rows, err := s.db.Query(`SELECT id, file, language, kind, name, signature, lines, source FROM nodes`)
 	if err != nil {
 		return nil, fmt.Errorf("querying all nodes: %w", err)
 	}
@@ -245,7 +268,7 @@ func (s *Store) AllNodes() ([]types.Node, error) {
 	var nodes []types.Node
 	for rows.Next() {
 		var n types.Node
-		if err := rows.Scan(&n.ID, &n.File, &n.Language, &n.Kind, &n.Name, &n.Signature, &n.Lines); err != nil {
+		if err := rows.Scan(&n.ID, &n.File, &n.Language, &n.Kind, &n.Name, &n.Signature, &n.Lines, &n.Source); err != nil {
 			return nil, fmt.Errorf("scanning node: %w", err)
 		}
 		nodes = append(nodes, n)
@@ -269,7 +292,7 @@ func (s *Store) Stats() (nodeCount int, edgeCount int, err error) {
 // SearchNodesBySuffix returns nodes whose name ends with ".<suffix>".
 func (s *Store) SearchNodesBySuffix(suffix string) ([]types.Node, error) {
 	pattern := "%." + suffix
-	rows, err := s.db.Query(`SELECT id, file, language, kind, name, signature, lines FROM nodes WHERE name LIKE ?`, pattern)
+	rows, err := s.db.Query(`SELECT id, file, language, kind, name, signature, lines, source FROM nodes WHERE name LIKE ?`, pattern)
 	if err != nil {
 		return nil, fmt.Errorf("search nodes by suffix %s: %w", suffix, err)
 	}
@@ -278,7 +301,7 @@ func (s *Store) SearchNodesBySuffix(suffix string) ([]types.Node, error) {
 	var nodes []types.Node
 	for rows.Next() {
 		var n types.Node
-		if err := rows.Scan(&n.ID, &n.File, &n.Language, &n.Kind, &n.Name, &n.Signature, &n.Lines); err != nil {
+		if err := rows.Scan(&n.ID, &n.File, &n.Language, &n.Kind, &n.Name, &n.Signature, &n.Lines, &n.Source); err != nil {
 			return nil, fmt.Errorf("scanning node: %w", err)
 		}
 		nodes = append(nodes, n)
@@ -293,7 +316,7 @@ func (s *Store) SearchNodesFuzzy(term string) ([]types.Node, error) {
 	for length := len(lowered); length >= 3; length-- {
 		prefix := lowered[:length]
 		rows, err := s.db.Query(
-			`SELECT id, file, language, kind, name, signature, lines FROM nodes WHERE LOWER(name) LIKE '%' || ? || '%' LIMIT 20`,
+			`SELECT id, file, language, kind, name, signature, lines, source FROM nodes WHERE LOWER(name) LIKE '%' || ? || '%' LIMIT 20`,
 			prefix,
 		)
 		if err != nil {
@@ -303,7 +326,7 @@ func (s *Store) SearchNodesFuzzy(term string) ([]types.Node, error) {
 		var nodes []types.Node
 		for rows.Next() {
 			var n types.Node
-			if err := rows.Scan(&n.ID, &n.File, &n.Language, &n.Kind, &n.Name, &n.Signature, &n.Lines); err != nil {
+			if err := rows.Scan(&n.ID, &n.File, &n.Language, &n.Kind, &n.Name, &n.Signature, &n.Lines, &n.Source); err != nil {
 				rows.Close()
 				return nil, fmt.Errorf("scanning node: %w", err)
 			}
@@ -322,7 +345,7 @@ func (s *Store) SearchNodesFuzzy(term string) ([]types.Node, error) {
 
 // GetNodesByFile returns all nodes belonging to the given file.
 func (s *Store) GetNodesByFile(file string) ([]types.Node, error) {
-	rows, err := s.db.Query(`SELECT id, file, language, kind, name, signature, lines FROM nodes WHERE file = ?`, file)
+	rows, err := s.db.Query(`SELECT id, file, language, kind, name, signature, lines, source FROM nodes WHERE file = ?`, file)
 	if err != nil {
 		return nil, fmt.Errorf("get nodes by file %s: %w", file, err)
 	}
@@ -331,7 +354,7 @@ func (s *Store) GetNodesByFile(file string) ([]types.Node, error) {
 	var nodes []types.Node
 	for rows.Next() {
 		var n types.Node
-		if err := rows.Scan(&n.ID, &n.File, &n.Language, &n.Kind, &n.Name, &n.Signature, &n.Lines); err != nil {
+		if err := rows.Scan(&n.ID, &n.File, &n.Language, &n.Kind, &n.Name, &n.Signature, &n.Lines, &n.Source); err != nil {
 			return nil, fmt.Errorf("scanning node: %w", err)
 		}
 		nodes = append(nodes, n)
@@ -361,7 +384,7 @@ func (s *Store) SearchFilesByKeyword(keyword string) ([]string, error) {
 // GetMethodsOfType returns all nodes whose name starts with "typeName.".
 func (s *Store) GetMethodsOfType(typeName string) ([]types.Node, error) {
 	pattern := typeName + ".%"
-	rows, err := s.db.Query(`SELECT id, file, language, kind, name, signature, lines FROM nodes WHERE name LIKE ?`, pattern)
+	rows, err := s.db.Query(`SELECT id, file, language, kind, name, signature, lines, source FROM nodes WHERE name LIKE ?`, pattern)
 	if err != nil {
 		return nil, fmt.Errorf("get methods of type %s: %w", typeName, err)
 	}
@@ -370,12 +393,149 @@ func (s *Store) GetMethodsOfType(typeName string) ([]types.Node, error) {
 	var nodes []types.Node
 	for rows.Next() {
 		var n types.Node
-		if err := rows.Scan(&n.ID, &n.File, &n.Language, &n.Kind, &n.Name, &n.Signature, &n.Lines); err != nil {
+		if err := rows.Scan(&n.ID, &n.File, &n.Language, &n.Kind, &n.Name, &n.Signature, &n.Lines, &n.Source); err != nil {
 			return nil, fmt.Errorf("scanning node: %w", err)
 		}
 		nodes = append(nodes, n)
 	}
 	return nodes, rows.Err()
+}
+
+// RebuildFTS rebuilds the FTS5 index from the nodes table.
+// Full resync: delete all FTS rows then reinsert from nodes.
+// This is correct for a plain (non-content) FTS5 table.
+func (s *Store) RebuildFTS() error {
+	if !s.ftsAvailable {
+		return nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin RebuildFTS transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`DELETE FROM nodes_fts`); err != nil {
+		return fmt.Errorf("clearing FTS index: %w", err)
+	}
+	if _, err := tx.Exec(`INSERT INTO nodes_fts(id, name, signature, source) SELECT id, name, signature, source FROM nodes`); err != nil {
+		return fmt.Errorf("populating FTS index: %w", err)
+	}
+	return tx.Commit()
+}
+
+// sanitizeFTSQuery wraps a plain search phrase in double quotes so that FTS5
+// special characters (parentheses, dots, hyphens, etc.) do not cause parse
+// errors. If the query already contains FTS5 operator syntax it is returned
+// unchanged, allowing callers to construct advanced queries deliberately.
+func sanitizeFTSQuery(q string) string {
+	operators := []string{`"`, `(`, `)`, " OR ", " AND ", " NOT ", " NEAR "}
+	for _, op := range operators {
+		if strings.Contains(q, op) {
+			return q
+		}
+	}
+	// Trailing * is a valid FTS5 prefix query (e.g., "foo*").
+	if strings.HasSuffix(q, "*") {
+		return q
+	}
+	return `"` + strings.ReplaceAll(q, `"`, `""`) + `"`
+}
+
+// SearchFTS performs a full-text search over node names, signatures, and source text.
+func (s *Store) SearchFTS(query string, limit int) ([]types.Node, error) {
+	if !s.ftsAvailable {
+		return nil, fmt.Errorf("FTS5 not available: rebuild with sqlite_fts5 build tag")
+	}
+	if limit <= 0 {
+		limit = 20
+	}
+	sanitized := sanitizeFTSQuery(query)
+	rows, err := s.db.Query(`
+		SELECT n.id, n.file, n.language, n.kind, n.name, n.signature, n.lines, n.source
+		FROM nodes_fts f
+		JOIN nodes n ON n.id = f.id
+		WHERE nodes_fts MATCH ?
+		ORDER BY rank
+		LIMIT ?`, sanitized, limit)
+	if err != nil {
+		return nil, fmt.Errorf("search failed: %w", err)
+	}
+	defer rows.Close()
+
+	var results []types.Node
+	for rows.Next() {
+		var n types.Node
+		if err := rows.Scan(&n.ID, &n.File, &n.Language, &n.Kind, &n.Name, &n.Signature, &n.Lines, &n.Source); err != nil {
+			return nil, fmt.Errorf("scanning FTS result: %w", err)
+		}
+		results = append(results, n)
+	}
+	return results, rows.Err()
+}
+
+// DetailedStats returns a breakdown of graph contents by node/edge kind and language.
+func (s *Store) DetailedStats() (*types.DetailedStats, error) {
+	stats := &types.DetailedStats{
+		NodesByKind: make(map[string]int),
+		EdgesByKind: make(map[string]int),
+		Languages:   make(map[string]int),
+	}
+
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM nodes`).Scan(&stats.NodeCount); err != nil {
+		return nil, fmt.Errorf("counting nodes: %w", err)
+	}
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM edges`).Scan(&stats.EdgeCount); err != nil {
+		return nil, fmt.Errorf("counting edges: %w", err)
+	}
+	if err := s.db.QueryRow(`SELECT COUNT(DISTINCT file) FROM nodes`).Scan(&stats.FileCount); err != nil {
+		return nil, fmt.Errorf("counting files: %w", err)
+	}
+
+	rows, err := s.db.Query(`SELECT kind, COUNT(*) FROM nodes GROUP BY kind`)
+	if err != nil {
+		return nil, fmt.Errorf("nodes by kind: %w", err)
+	}
+	for rows.Next() {
+		var kind string
+		var count int
+		if err := rows.Scan(&kind, &count); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		stats.NodesByKind[kind] = count
+	}
+	rows.Close()
+
+	rows, err = s.db.Query(`SELECT kind, COUNT(*) FROM edges GROUP BY kind`)
+	if err != nil {
+		return nil, fmt.Errorf("edges by kind: %w", err)
+	}
+	for rows.Next() {
+		var kind string
+		var count int
+		if err := rows.Scan(&kind, &count); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		stats.EdgesByKind[kind] = count
+	}
+	rows.Close()
+
+	rows, err = s.db.Query(`SELECT language, COUNT(*) FROM nodes GROUP BY language`)
+	if err != nil {
+		return nil, fmt.Errorf("languages: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var lang string
+		var count int
+		if err := rows.Scan(&lang, &count); err != nil {
+			return nil, err
+		}
+		stats.Languages[lang] = count
+	}
+
+	return stats, rows.Err()
 }
 
 // Close closes the underlying database connection.

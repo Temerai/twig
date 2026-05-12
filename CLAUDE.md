@@ -4,18 +4,19 @@ Reduces LLM token usage by pre-indexing your codebase into a graph. Instead of r
 
 ## Build & Test
 
-Always build and install using zig as the C compiler (required for cgo on this machine):
+Cross-platform build script (auto-detects zig, applies FTS5 tag):
 
 ```powershell
-$env:CC="zig cc"; go install ./cmd/twig/
+go run build.go          # build
+go run build.go test     # run tests
+go run build.go smoke    # full verification (vet + build + index + smoke tests)
+go run build.go clean    # remove build artifacts
 ```
 
-Other useful commands:
+Manual build (if needed):
 
 ```powershell
-go vet ./...                            # lint
-twig index .                            # index this repo as a smoke test
-twig graph callers NewStore --depth 1   # verify graph works
+$env:CC="zig cc"; go build -tags sqlite_fts5 -o .\twig.exe ./cmd/twig/
 ```
 
 ## Project Layout
@@ -37,13 +38,23 @@ twig graph callers NewStore --depth 1   # verify graph works
 - No API clients, no network calls. Fully offline.
 - The LLM is the editor (Claude Code, Copilot). twig just serves graph context.
 - Seed extraction is heuristic (camelCase split, stop words, dot-join).
-- MCP server exposes 5 tools: query_codebase, analyze_impact, graph_explore, graph_stats, index_codebase.
+- MCP server exposes 7 tools: query_codebase, analyze_impact, graph_explore, graph_stats, get_symbol, index_codebase, search_codebase.
 
 ## Adding a Language
 
 1. `go get github.com/smacker/go-tree-sitter/{language}`
 2. Register extension in `internal/parser/grammar.go`
 3. Add walker in `internal/parser/extract.go`
+
+## Functionality Tests
+
+End-to-end integration tests that index twig's own source and exercise every major feature. Run when asked to verify functionality:
+
+```powershell
+go test -tags sqlite_fts5 -v -count=1 ./internal/integration/
+```
+
+Tests cover: graph indexing, USES edges (Go/Java/C#), analyze_impact, query_codebase (all 4 strategies), get_symbol, search_codebase (FTS5 + special chars + OR), graph_explore (callers/callees/deps), incremental reindex, detailed stats, and budget enforcement. Located in `internal/integration/functionality_test.go`.
 
 ## Adding a Task Type
 

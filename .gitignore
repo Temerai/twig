@@ -25,3 +25,4 @@ vendor/
 
 # Dev notes
 ninja_stuff
+/.claude/

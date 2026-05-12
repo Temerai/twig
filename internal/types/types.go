@@ -8,14 +8,15 @@ type Node struct {
 	Kind      string // function, method, class, struct, interface
 	Name      string
 	Signature string
-	Lines     string // "10-25"
+	Lines     string
+	Source    string
 }
 
 // Edge represents a relationship between two nodes in the codebase graph.
 type Edge struct {
 	Src  string
 	Dst  string
-	Kind string // CALLS, IMPORTS, DEFINES, INHERITS
+	Kind string // CALLS, IMPORTS, USES
 }
 
 // CodeSnippet holds a retrieved source code fragment with metadata.
@@ -34,6 +35,7 @@ const (
 	StrategyBFS    TraversalStrategy = "bfs"
 	StrategyScored TraversalStrategy = "scored"
 	StrategyDeep   TraversalStrategy = "deep"
+	StrategyCallers TraversalStrategy = "callers"
 )
 
 // QueryRequest describes a natural-language query against the codebase graph.
@@ -53,9 +55,20 @@ type QueryResult struct {
 // ImpactReport describes the blast radius of a change to a given node.
 type ImpactReport struct {
 	DirectCallers  []Node
+	DirectUsers    []Node
 	TransitiveDeps []Node
 	AffectedFiles  []string
 	RiskScore      int
+}
+
+// DetailedStats holds a breakdown of the graph contents by kind and language.
+type DetailedStats struct {
+	NodeCount    int
+	EdgeCount    int
+	NodesByKind  map[string]int
+	EdgesByKind  map[string]int
+	Languages    map[string]int
+	FileCount    int
 }
 
 // GraphAnswer is a structured response combining a summary with graph data.
