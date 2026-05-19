@@ -32,7 +32,7 @@ func main() {
 
 	rootCmd.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
 		// Change to the directory containing the config file so that relative
-		// paths in the config (db_path, codebase_root) resolve correctly.
+		// paths in the config (codebase_root) resolve correctly.
 		if configFile != "config.yaml" {
 			dir := filepath.Dir(configFile)
 			if dir != "." && dir != "" {

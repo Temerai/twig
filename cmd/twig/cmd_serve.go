@@ -25,17 +25,12 @@ func newServeCmd() *cobra.Command {
 				return fmt.Errorf("--mcp flag is required (only MCP server mode is currently supported)")
 			}
 
-			sc, err := initServeComponents()
-			if err != nil {
-				return err
-			}
-			defer sc.Close()
-
 			// Set up signal-aware context for graceful shutdown.
 			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
 
-			server := mcp.NewServer(sc.store, sc.indexer, sc.agent, sc.intel)
+			server := mcp.NewServer(cfg.CodebaseRoot)
+			defer server.Close()
 
 			fmt.Fprintln(os.Stderr, "twig MCP server started")
 			return server.Serve(ctx)

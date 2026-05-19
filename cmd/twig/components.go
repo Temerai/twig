@@ -26,7 +26,7 @@ type components struct {
 }
 
 func initComponents() (*components, error) {
-	store, err := parser.NewStore(cfg.DBPath)
+	store, err := parser.NewStore(parser.DBPathForRoot(cfg.CodebaseRoot))
 	if err != nil {
 		return nil, fmt.Errorf("opening store: %w", err)
 	}
@@ -42,7 +42,7 @@ func initComponents() (*components, error) {
 		return nil, fmt.Errorf("loading prompt registry: %w", err)
 	}
 
-	log, err := logger.NewLogger(cfg.DBPath + ".log")
+	log, err := logger.NewLogger(parser.LogPathForRoot(cfg.CodebaseRoot))
 	if err != nil {
 		store.Close()
 		return nil, fmt.Errorf("opening logger: %w", err)
@@ -76,7 +76,7 @@ type graphComponents struct {
 }
 
 func initGraphComponents() (*graphComponents, error) {
-	store, err := parser.NewStore(cfg.DBPath)
+	store, err := parser.NewStore(parser.DBPathForRoot(cfg.CodebaseRoot))
 	if err != nil {
 		return nil, fmt.Errorf("opening store: %w", err)
 	}
@@ -87,37 +87,5 @@ func initGraphComponents() (*graphComponents, error) {
 func (gc *graphComponents) Close() {
 	if gc.store != nil {
 		gc.store.Close()
-	}
-}
-
-// serveComponents holds the subset of components needed by the MCP server:
-// store, indexer, graph agent, and graph intel. No registry, logger, or
-// orchestrator required.
-type serveComponents struct {
-	store   *parser.Store
-	indexer *parser.Indexer
-	agent   *graphagent.GraphAgent
-	intel   *graphintel.GraphIntel
-}
-
-func initServeComponents() (*serveComponents, error) {
-	store, err := parser.NewStore(cfg.DBPath)
-	if err != nil {
-		return nil, fmt.Errorf("opening store: %w", err)
-	}
-	indexer := parser.NewIndexer(store, cfg.CodebaseRoot)
-	agent := graphagent.NewGraphAgent(store)
-	intel := graphintel.NewGraphIntel(store)
-	return &serveComponents{
-		store:   store,
-		indexer: indexer,
-		agent:   agent,
-		intel:   intel,
-	}, nil
-}
-
-func (sc *serveComponents) Close() {
-	if sc.store != nil {
-		sc.store.Close()
 	}
 }

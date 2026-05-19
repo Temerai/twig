@@ -107,25 +107,64 @@ type schemaProperty struct {
 
 // Server implements a minimal MCP server over stdio using JSON-RPC 2.0.
 type Server struct {
-	store   *parser.Store
-	indexer *parser.Indexer
-	agent   *graphagent.GraphAgent
-	intel   *graphintel.GraphIntel
+	rootPath string
+	store    *parser.Store
+	indexer  *parser.Indexer
+	agent    *graphagent.GraphAgent
+	intel    *graphintel.GraphIntel
 }
 
-// NewServer creates a new MCP server wired to the provided components.
-func NewServer(
-	store *parser.Store,
-	indexer *parser.Indexer,
-	agent *graphagent.GraphAgent,
-	intel *graphintel.GraphIntel,
-) *Server {
-	return &Server{
-		store:   store,
-		indexer: indexer,
-		agent:   agent,
-		intel:   intel,
+// NewServer creates a new MCP server. Components are initialised lazily on the
+// first index_codebase call (or on the first read-tool call if a DB already
+// exists at the derived path).
+func NewServer(rootPath string) *Server {
+	return &Server{rootPath: rootPath}
+}
+
+// Close releases any open database connection.
+func (s *Server) Close() {
+	if s.store != nil {
+		s.store.Close()
+		s.store = nil
 	}
+}
+
+// ensureStore opens (or creates) the store for root, replacing the existing one
+// if the root has changed.
+func (s *Server) ensureStore(root string) error {
+	if s.store != nil && s.rootPath == root {
+		return nil
+	}
+	if s.store != nil {
+		s.store.Close()
+		s.store = nil
+		s.indexer = nil
+		s.agent = nil
+		s.intel = nil
+	}
+	s.rootPath = root
+	store, err := parser.NewStore(parser.DBPathForRoot(root))
+	if err != nil {
+		return err
+	}
+	s.store = store
+	s.indexer = parser.NewIndexer(store, root)
+	s.agent = graphagent.NewGraphAgent(store)
+	s.intel = graphintel.NewGraphIntel(store)
+	return nil
+}
+
+// openIfExists opens an existing DB for the configured root without creating one.
+// Returns false if no DB exists yet, indicating the codebase has not been indexed.
+func (s *Server) openIfExists() bool {
+	if s.store != nil {
+		return true
+	}
+	dbPath := parser.DBPathForRoot(s.rootPath)
+	if _, err := os.Stat(dbPath); err != nil {
+		return false
+	}
+	return s.ensureStore(s.rootPath) == nil
 }
 
 // Serve runs the main read-dispatch-write loop on stdin/stdout. It blocks
@@ -493,6 +532,9 @@ type queryCodebaseArgs struct {
 }
 
 func (s *Server) callQueryCodebase(ctx context.Context, raw json.RawMessage) toolResult {
+	if !s.openIfExists() {
+		return makeErrorResult("codebase not indexed — call index_codebase first")
+	}
 	var args queryCodebaseArgs
 	if err := json.Unmarshal(raw, &args); err != nil {
 		return makeErrorResult("invalid arguments: " + err.Error())
@@ -556,6 +598,9 @@ type analyzeImpactArgs struct {
 }
 
 func (s *Server) callAnalyzeImpact(ctx context.Context, raw json.RawMessage) toolResult {
+	if !s.openIfExists() {
+		return makeErrorResult("codebase not indexed — call index_codebase first")
+	}
 	var args analyzeImpactArgs
 	if err := json.Unmarshal(raw, &args); err != nil {
 		return makeErrorResult("invalid arguments: " + err.Error())
@@ -607,6 +652,9 @@ type graphExploreArgs struct {
 }
 
 func (s *Server) callGraphExplore(ctx context.Context, raw json.RawMessage) toolResult {
+	if !s.openIfExists() {
+		return makeErrorResult("codebase not indexed — call index_codebase first")
+	}
 	var args graphExploreArgs
 	if err := json.Unmarshal(raw, &args); err != nil {
 		return makeErrorResult("invalid arguments: " + err.Error())
@@ -662,6 +710,9 @@ func formatNodeList(label, symbol string, nodes []types.Node) string {
 // --- graph_stats ---
 
 func (s *Server) callGraphStats() toolResult {
+	if !s.openIfExists() {
+		return makeErrorResult("codebase not indexed — call index_codebase first")
+	}
 	stats, err := s.store.DetailedStats()
 	if err != nil {
 		return makeErrorResult(fmt.Sprintf("stats failed: %v", err))
@@ -676,6 +727,9 @@ func (s *Server) callGraphStats() toolResult {
 // --- get_symbol ---
 
 func (s *Server) callGetSymbol(ctx context.Context, raw json.RawMessage) toolResult {
+	if !s.openIfExists() {
+		return makeErrorResult("codebase not indexed — call index_codebase first")
+	}
 	var args struct {
 		Name string `json:"name"`
 		Kind string `json:"kind"`
@@ -722,6 +776,9 @@ func (s *Server) callGetSymbol(ctx context.Context, raw json.RawMessage) toolRes
 // --- search_codebase ---
 
 func (s *Server) callSearchCodebase(ctx context.Context, raw json.RawMessage) toolResult {
+	if !s.openIfExists() {
+		return makeErrorResult("codebase not indexed — call index_codebase first")
+	}
 	var args struct {
 		Query string `json:"query"`
 		Limit int    `json:"limit"`
@@ -767,13 +824,19 @@ func (s *Server) callIndexCodebase(raw json.RawMessage) toolResult {
 	}
 
 	if len(args.ChangedFiles) > 0 {
+		if err := s.ensureStore(s.rootPath); err != nil {
+			return makeErrorResult("opening store: " + err.Error())
+		}
 		if err := s.indexer.Reindex(args.ChangedFiles); err != nil {
 			return makeErrorResult(fmt.Sprintf("reindex failed: %v", err))
 		}
 	} else {
 		root := args.Path
 		if root == "" {
-			root = s.indexer.RootPath()
+			root = s.rootPath
+		}
+		if err := s.ensureStore(root); err != nil {
+			return makeErrorResult("opening store: " + err.Error())
 		}
 		if err := s.indexer.Index(root); err != nil {
 			return makeErrorResult(fmt.Sprintf("index failed: %v", err))

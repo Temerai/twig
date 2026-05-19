@@ -19,7 +19,7 @@ func newIndexCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			rootPath := args[0]
 
-			store, err := parser.NewStore(cfg.DBPath)
+			store, err := parser.NewStore(parser.DBPathForRoot(rootPath))
 			if err != nil {
 				return fmt.Errorf("opening store: %w", err)
 			}

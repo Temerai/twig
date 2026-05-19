@@ -11,7 +11,6 @@ import (
 // Config holds the application configuration loaded from config.yaml.
 type Config struct {
 	DefaultTokenBudget int    `yaml:"default_token_budget"`
-	DBPath             string `yaml:"db_path"`
 	CodebaseRoot       string `yaml:"codebase_root"`
 }
 
@@ -31,9 +30,6 @@ func expandEnvVars(s string) string {
 func (c *Config) applyDefaults() {
 	if c.DefaultTokenBudget == 0 {
 		c.DefaultTokenBudget = 4000
-	}
-	if c.DBPath == "" {
-		c.DBPath = "./twig.db"
 	}
 	if c.CodebaseRoot == "" {
 		c.CodebaseRoot = "./"

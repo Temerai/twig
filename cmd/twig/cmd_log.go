@@ -7,6 +7,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/Temerai/twig/internal/logger"
+	"github.com/Temerai/twig/internal/parser"
 )
 
 // --- log command group ---
@@ -31,7 +32,7 @@ func newLogListCmd() *cobra.Command {
 		Use:   "list",
 		Short: "List recent runs",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			log, err := logger.NewLogger(cfg.DBPath + ".log")
+			log, err := logger.NewLogger(parser.LogPathForRoot(cfg.CodebaseRoot))
 			if err != nil {
 				return fmt.Errorf("opening logger: %w", err)
 			}

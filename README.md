@@ -84,7 +84,6 @@ Optional `config.yaml` in working directory:
 
 ```yaml
 default_token_budget: 4000
-db_path: ./twig.db
 codebase_root: ./
 ```
 

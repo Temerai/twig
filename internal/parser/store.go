@@ -3,12 +3,24 @@ package parser
 import (
 	"database/sql"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 
 	_ "github.com/mattn/go-sqlite3"
 
 	"github.com/Temerai/twig/internal/types"
 )
+
+// DBPathForRoot returns the path to the SQLite database for the given codebase root.
+func DBPathForRoot(root string) string {
+	return filepath.Join(root, ".twig", "twig.db")
+}
+
+// LogPathForRoot returns the path to the execution log database for the given codebase root.
+func LogPathForRoot(root string) string {
+	return filepath.Join(root, ".twig", "twig.log")
+}
 
 // Store provides a SQLite-backed graph store for codebase nodes and edges.
 type Store struct {
@@ -19,6 +31,9 @@ type Store struct {
 // NewStore opens (or creates) a SQLite database at dbPath and initialises
 // the schema. The caller must call Close when done.
 func NewStore(dbPath string) (*Store, error) {
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0755); err != nil {
+		return nil, fmt.Errorf("creating database directory: %w", err)
+	}
 	db, err := sql.Open("sqlite3", dbPath+"?_journal_mode=WAL&_synchronous=NORMAL")
 	if err != nil {
 		return nil, fmt.Errorf("opening database: %w", err)
